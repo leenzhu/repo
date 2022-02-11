@@ -1,5 +1,3 @@
-# -*- coding:utf-8 -*-
-#
 # Copyright (C) 2009 The Android Open Source Project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import print_function
 from optparse import SUPPRESS_HELP
 import sys
 
@@ -24,7 +21,7 @@ from subcmds.sync import _PostRepoFetch
 
 
 class Selfupdate(Command, MirrorSafeCommand):
-  common = False
+  COMMON = False
   helpSummary = "Update repo to the latest version"
   helpUsage = """
 %prog

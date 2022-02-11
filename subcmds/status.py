@@ -1,5 +1,3 @@
-# -*- coding:utf-8 -*-
-#
 # Copyright (C) 2008 The Android Open Source Project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,21 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import print_function
-
 import functools
 import glob
-import multiprocessing
+import io
 import os
 
-from command import PagedCommand
+from command import DEFAULT_LOCAL_JOBS, PagedCommand
 
 from color import Coloring
 import platform_utils
 
 
 class Status(PagedCommand):
-  common = True
+  COMMON = True
   helpSummary = "Show the working tree status"
   helpUsage = """
 %prog [<project>...]
@@ -80,16 +76,12 @@ the following meanings:
  d:  deleted       (    in index, not in work tree                )
 
 """
+  PARALLEL_JOBS = DEFAULT_LOCAL_JOBS
 
   def _Options(self, p):
-    p.add_option('-j', '--jobs',
-                 dest='jobs', action='store', type='int', default=2,
-                 help="number of projects to check simultaneously")
     p.add_option('-o', '--orphans',
                  dest='orphans', action='store_true',
                  help="include objects in working directory outside of repo projects")
-    p.add_option('-q', '--quiet', action='store_true',
-                 help="only print the name of modified projects")
 
   def _StatusHelper(self, quiet, project):
     """Obtains the status for a specific project.
@@ -104,7 +96,9 @@ the following meanings:
     Returns:
       The status of the project.
     """
-    return project.PrintWorkTreeStatus(quiet=quiet)
+    buf = io.StringIO()
+    ret = project.PrintWorkTreeStatus(quiet=quiet, output_redir=buf)
+    return (ret, buf.getvalue())
 
   def _FindOrphans(self, dirs, proj_dirs, proj_dirs_parents, outstring):
     """find 'dirs' that are present in 'proj_dirs_parents' but not in 'proj_dirs'"""
@@ -124,17 +118,23 @@ the following meanings:
 
   def Execute(self, opt, args):
     all_projects = self.GetProjects(args)
-    counter = 0
 
-    if opt.jobs == 1:
-      for project in all_projects:
-        state = project.PrintWorkTreeStatus(quiet=opt.quiet)
+    def _ProcessResults(_pool, _output, results):
+      ret = 0
+      for (state, output) in results:
+        if output:
+          print(output, end='')
         if state == 'CLEAN':
-          counter += 1
-    else:
-      with multiprocessing.Pool(opt.jobs) as pool:
-        states = pool.map(functools.partial(self._StatusHelper, opt.quiet), all_projects)
-        counter += states.count('CLEAN')
+          ret += 1
+      return ret
+
+    counter = self.ExecuteInParallel(
+        opt.jobs,
+        functools.partial(self._StatusHelper, opt.quiet),
+        all_projects,
+        callback=_ProcessResults,
+        ordered=True)
+
     if not opt.quiet and len(all_projects) == counter:
       print('nothing to commit (working directory clean)')
 
@@ -165,7 +165,7 @@ the following meanings:
                           proj_dirs, proj_dirs_parents, outstring)
 
         if outstring:
-          output = StatusColoring(self.manifest.globalConfig)
+          output = StatusColoring(self.client.globalConfig)
           output.project('Objects not within a project (orphans)')
           output.nl()
           for entry in outstring:

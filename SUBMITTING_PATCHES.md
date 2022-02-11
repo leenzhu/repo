@@ -3,14 +3,14 @@
 # Short Version
 
  - Make small logical changes.
- - Provide a meaningful commit message.
+ - [Provide a meaningful commit message][commit-message-style].
  - Check for coding errors and style nits with flake8.
  - Make sure all code is under the Apache License, 2.0.
  - Publish your changes for review.
  - Make corrections if requested.
  - Verify your changes on gerrit so they can be submitted.
 
-   `git push https://gerrit-review.googlesource.com/git-repo HEAD:refs/for/master`
+   `git push https://gerrit-review.googlesource.com/git-repo HEAD:refs/for/main`
 
 
 # Long Version
@@ -26,10 +26,11 @@ yourself with the following relevant bits.
 
 ## Make separate commits for logically separate changes.
 
-Unless your patch is really trivial, you should not be sending
-out a patch that was generated between your working tree and your
-commit head.  Instead, always make a commit with complete commit
-message and generate a series of patches from your repository.
+Unless your patch is really trivial, you should not be sending out a patch that
+was generated between your working tree and your commit head.
+Instead, always make a commit with a complete
+[commit message][commit-message-style] and generate a series of patches from
+your repository.
 It is a good discipline.
 
 Describe the technical detail of the change(s).
@@ -150,7 +151,7 @@ Push your patches over HTTPS to the review server, possibly through
 a remembered remote to make this easier in the future:
 
     git config remote.review.url https://gerrit-review.googlesource.com/git-repo
-    git config remote.review.push HEAD:refs/for/master
+    git config remote.review.push HEAD:refs/for/main
 
     git push review
 
@@ -171,3 +172,6 @@ After you receive a Code-Review+2 from the maintainer, select the Verified
 button on the gerrit page for the change. This verifies that you have tested
 your changes and notifies the maintainer that they are ready to be submitted.
 The maintainer will then submit your changes to the repository.
+
+
+[commit-message-style]: https://chris.beams.io/posts/git-commit/

@@ -1,5 +1,4 @@
-#!/usr/bin/env python
-# -*- coding:utf-8 -*-
+#!/usr/bin/env python3
 #
 # Copyright (C) 2008 The Android Open Source Project
 #
@@ -21,7 +20,6 @@ People shouldn't run this directly; instead, they should use the `repo` wrapper
 which takes care of execing this entry point.
 """
 
-from __future__ import print_function
 import getpass
 import netrc
 import optparse
@@ -30,15 +28,7 @@ import shlex
 import sys
 import textwrap
 import time
-
-from pyversion import is_python3
-if is_python3():
-  import urllib.request
-else:
-  import imp
-  import urllib2
-  urllib = imp.new_module('urllib')
-  urllib.request = urllib2
+import urllib.request
 
 try:
   import kerberos
@@ -49,7 +39,8 @@ from color import SetDefaultColoring
 import event_log
 from repo_trace import SetTrace
 from git_command import user_agent
-from git_config import init_ssh, close_ssh, RepoConfig
+from git_config import RepoConfig
+from git_trace2_event_log import EventLog
 from command import InteractiveCommand
 from command import MirrorSafeCommand
 from command import GitcAvailableCommand, GitcClientCommand
@@ -63,14 +54,12 @@ from error import NoManifestException
 from error import NoSuchProjectError
 from error import RepoChangedException
 import gitc_utils
-from manifest_xml import GitcManifest, XmlManifest
+from manifest_xml import GitcClient, RepoClient
 from pager import RunPager, TerminatePager
 from wrapper import WrapperPath, Wrapper
 
 from subcmds import all_commands
 
-if not is_python3():
-  input = raw_input  # noqa: F821
 
 # NB: These do not need to be kept in sync with the repo launcher script.
 # These may be much newer as it allows the repo launcher to roll between
@@ -82,12 +71,13 @@ if not is_python3():
 #
 # python-3.6 is in Ubuntu Bionic.
 MIN_PYTHON_VERSION_SOFT = (3, 6)
-MIN_PYTHON_VERSION_HARD = (3, 4)
+MIN_PYTHON_VERSION_HARD = (3, 6)
 
 if sys.version_info.major < 3:
-  print('repo: warning: Python 2 is no longer supported; '
+  print('repo: error: Python 2 is no longer supported; '
         'Please upgrade to Python {}.{}+.'.format(*MIN_PYTHON_VERSION_SOFT),
         file=sys.stderr)
+  sys.exit(1)
 else:
   if sys.version_info < MIN_PYTHON_VERSION_HARD:
     print('repo: error: Python 3 version is too old; '
@@ -105,6 +95,8 @@ global_options = optparse.OptionParser(
     add_help_option=False)
 global_options.add_option('-h', '--help', action='store_true',
                           help='show this help message and exit')
+global_options.add_option('--help-all', action='store_true',
+                          help='show this help message with all subcommands and exit')
 global_options.add_option('-p', '--paginate',
                           dest='pager', action='store_true',
                           help='display command output in the pager')
@@ -126,9 +118,15 @@ global_options.add_option('--time',
 global_options.add_option('--version',
                           dest='show_version', action='store_true',
                           help='display this version of repo')
+global_options.add_option('--show-toplevel',
+                          action='store_true',
+                          help='display the path of the top-level directory of '
+                               'the repo client checkout')
 global_options.add_option('--event-log',
                           dest='event_log', action='store',
                           help='filename of event log to append timeline to')
+global_options.add_option('--git-trace2-event-log', action='store',
+                          help='directory to write git trace2 event log to')
 
 
 class _Repo(object):
@@ -136,34 +134,40 @@ class _Repo(object):
     self.repodir = repodir
     self.commands = all_commands
 
+  def _PrintHelp(self, short: bool = False, all_commands: bool = False):
+    """Show --help screen."""
+    global_options.print_help()
+    print()
+    if short:
+      commands = ' '.join(sorted(self.commands))
+      wrapped_commands = textwrap.wrap(commands, width=77)
+      print('Available commands:\n  %s' % ('\n  '.join(wrapped_commands),))
+      print('\nRun `repo help <command>` for command-specific details.')
+      print('Bug reports:', Wrapper().BUG_URL)
+    else:
+      cmd = self.commands['help']()
+      if all_commands:
+        cmd.PrintAllCommandsBody()
+      else:
+        cmd.PrintCommonCommandsBody()
+
   def _ParseArgs(self, argv):
     """Parse the main `repo` command line options."""
-    name = None
-    glob = []
-
-    for i in range(len(argv)):
-      if not argv[i].startswith('-'):
-        name = argv[i]
-        if i > 0:
-          glob = argv[:i]
+    for i, arg in enumerate(argv):
+      if not arg.startswith('-'):
+        name = arg
+        glob = argv[:i]
         argv = argv[i + 1:]
         break
-    if not name:
+    else:
+      name = None
       glob = argv
-      name = 'help'
       argv = []
     gopts, _gargs = global_options.parse_args(glob)
 
-    name, alias_args = self._ExpandAlias(name)
-    argv = alias_args + argv
-
-    if gopts.help:
-      global_options.print_help()
-      commands = ' '.join(sorted(self.commands))
-      wrapped_commands = textwrap.wrap(commands, width=77)
-      print('\nAvailable commands:\n  %s' % ('\n  '.join(wrapped_commands),))
-      print('\nRun `repo help <command>` for command-specific details.')
-      global_options.exit()
+    if name:
+      name, alias_args = self._ExpandAlias(name)
+      argv = alias_args + argv
 
     return (name, gopts, argv)
 
@@ -194,31 +198,45 @@ class _Repo(object):
 
     if gopts.trace:
       SetTrace()
-    if gopts.show_version:
-      if name == 'help':
-        name = 'version'
-      else:
-        print('fatal: invalid usage of --version', file=sys.stderr)
-        return 1
+
+    # Handle options that terminate quickly first.
+    if gopts.help or gopts.help_all:
+      self._PrintHelp(short=False, all_commands=gopts.help_all)
+      return 0
+    elif gopts.show_version:
+      # Always allow global --version regardless of subcommand validity.
+      name = 'version'
+    elif gopts.show_toplevel:
+      print(os.path.dirname(self.repodir))
+      return 0
+    elif not name:
+      # No subcommand specified, so show the help/subcommand.
+      self._PrintHelp(short=True)
+      return 1
 
     SetDefaultColoring(gopts.color)
 
+    git_trace2_event_log = EventLog()
+    repo_client = RepoClient(self.repodir)
+    gitc_manifest = None
+    gitc_client_name = gitc_utils.parse_clientdir(os.getcwd())
+    if gitc_client_name:
+      gitc_manifest = GitcClient(self.repodir, gitc_client_name)
+      repo_client.isGitcClient = True
+
     try:
-      cmd = self.commands[name]()
+      cmd = self.commands[name](
+          repodir=self.repodir,
+          client=repo_client,
+          manifest=repo_client.manifest,
+          gitc_manifest=gitc_manifest,
+          git_event_log=git_trace2_event_log)
     except KeyError:
       print("repo: '%s' is not a repo command.  See 'repo help'." % name,
             file=sys.stderr)
       return 1
 
-    cmd.repodir = self.repodir
-    cmd.manifest = XmlManifest(cmd.repodir)
-    cmd.gitc_manifest = None
-    gitc_client_name = gitc_utils.parse_clientdir(os.getcwd())
-    if gitc_client_name:
-      cmd.gitc_manifest = GitcManifest(cmd.repodir, gitc_client_name)
-      cmd.manifest.isGitcClient = True
-
-    Editor.globalConfig = cmd.manifest.globalConfig
+    Editor.globalConfig = cmd.client.globalConfig
 
     if not isinstance(cmd, MirrorSafeCommand) and cmd.manifest.IsMirror:
       print("fatal: '%s' requires a working directory" % name,
@@ -246,7 +264,7 @@ class _Repo(object):
       return 1
 
     if gopts.pager is not False and not isinstance(cmd, InteractiveCommand):
-      config = cmd.manifest.globalConfig
+      config = cmd.client.globalConfig
       if gopts.pager:
         use_pager = True
       else:
@@ -259,7 +277,11 @@ class _Repo(object):
     start = time.time()
     cmd_event = cmd.event_log.Add(name, event_log.TASK_COMMAND, start)
     cmd.event_log.SetParent(cmd_event)
+    git_trace2_event_log.StartEvent()
+    git_trace2_event_log.CommandEvent(name='repo', subcommands=[name])
+
     try:
+      cmd.CommonValidateOptions(copts, cargs)
       cmd.ValidateOptions(copts, cargs)
       result = cmd.Execute(copts, cargs)
     except (DownloadError, ManifestInvalidRevisionError,
@@ -301,10 +323,15 @@ class _Repo(object):
 
       cmd.event_log.FinishEvent(cmd_event, finish,
                                 result is None or result == 0)
+      git_trace2_event_log.DefParamRepoEvents(
+          cmd.manifest.manifestProject.config.DumpConfigDict())
+      git_trace2_event_log.ExitEvent(result)
+
       if gopts.event_log:
         cmd.event_log.Write(os.path.abspath(
                             os.path.expanduser(gopts.event_log)))
 
+      git_trace2_event_log.Write(gopts.git_trace2_event_log)
     return result
 
 
@@ -588,20 +615,16 @@ def _Main(argv):
 
   repo = _Repo(opt.repodir)
   try:
-    try:
-      init_ssh()
-      init_http()
-      name, gopts, argv = repo._ParseArgs(argv)
-      run = lambda: repo._Run(name, gopts, argv) or 0
-      if gopts.trace_python:
-        import trace
-        tracer = trace.Trace(count=False, trace=True, timing=True,
-                             ignoredirs=set(sys.path[1:]))
-        result = tracer.runfunc(run)
-      else:
-        result = run()
-    finally:
-      close_ssh()
+    init_http()
+    name, gopts, argv = repo._ParseArgs(argv)
+    run = lambda: repo._Run(name, gopts, argv) or 0
+    if gopts.trace_python:
+      import trace
+      tracer = trace.Trace(count=False, trace=True, timing=True,
+                           ignoredirs=set(sys.path[1:]))
+      result = tracer.runfunc(run)
+    else:
+      result = run()
   except KeyboardInterrupt:
     print('aborted by user', file=sys.stderr)
     result = 1
