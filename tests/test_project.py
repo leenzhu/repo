@@ -1,5 +1,3 @@
-# -*- coding:utf-8 -*-
-#
 # Copyright (C) 2019 The Android Open Source Project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,16 +14,16 @@
 
 """Unittests for the project.py module."""
 
-from __future__ import print_function
-
 import contextlib
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
 
 import error
+import git_command
 import git_config
 import platform_utils
 import project
@@ -38,7 +36,19 @@ def TempGitTree():
   # Python 2 support entirely.
   try:
     tempdir = tempfile.mkdtemp(prefix='repo-tests')
-    subprocess.check_call(['git', 'init'], cwd=tempdir)
+
+    # Tests need to assume, that main is default branch at init,
+    # which is not supported in config until 2.28.
+    cmd = ['git', 'init']
+    if git_command.git_require((2, 28, 0)):
+      cmd += ['--initial-branch=main']
+    else:
+      # Use template dir for init.
+      templatedir = tempfile.mkdtemp(prefix='.test-template')
+      with open(os.path.join(templatedir, 'HEAD'), 'w') as fp:
+        fp.write('ref: refs/heads/main\n')
+      cmd += ['--template', templatedir]
+    subprocess.check_call(cmd, cwd=tempdir)
     yield tempdir
   finally:
     platform_utils.rmtree(tempdir)
@@ -77,7 +87,7 @@ class ReviewableBranchTests(unittest.TestCase):
 
       # Start off with the normal details.
       rb = project.ReviewableBranch(
-          fakeproj, fakeproj.config.GetBranch('work'), 'master')
+          fakeproj, fakeproj.config.GetBranch('work'), 'main')
       self.assertEqual('work', rb.name)
       self.assertEqual(1, len(rb.commits))
       self.assertIn('Del file', rb.commits[0])
@@ -90,9 +100,9 @@ class ReviewableBranchTests(unittest.TestCase):
       self.assertTrue(rb.date)
 
       # Now delete the tracking branch!
-      fakeproj.work_git.branch('-D', 'master')
+      fakeproj.work_git.branch('-D', 'main')
       rb = project.ReviewableBranch(
-          fakeproj, fakeproj.config.GetBranch('work'), 'master')
+          fakeproj, fakeproj.config.GetBranch('work'), 'main')
       self.assertEqual(0, len(rb.commits))
       self.assertFalse(rb.base_exists)
       # Hard to assert anything useful about this.
@@ -326,3 +336,76 @@ class LinkFile(CopyLinkTestCase):
     platform_utils.symlink(self.tempdir, dest)
     lf._Link()
     self.assertEqual(os.path.join('git-project', 'foo.txt'), os.readlink(dest))
+
+
+class MigrateWorkTreeTests(unittest.TestCase):
+  """Check _MigrateOldWorkTreeGitDir handling."""
+
+  _SYMLINKS = {
+      'config', 'description', 'hooks', 'info', 'logs', 'objects',
+      'packed-refs', 'refs', 'rr-cache', 'shallow', 'svn',
+  }
+  _FILES = {
+      'COMMIT_EDITMSG', 'FETCH_HEAD', 'HEAD', 'index', 'ORIG_HEAD',
+      'unknown-file-should-be-migrated',
+  }
+  _CLEAN_FILES = {
+      'a-vim-temp-file~', '#an-emacs-temp-file#',
+  }
+
+  @classmethod
+  @contextlib.contextmanager
+  def _simple_layout(cls):
+    """Create a simple repo client checkout to test against."""
+    with tempfile.TemporaryDirectory() as tempdir:
+      tempdir = Path(tempdir)
+
+      gitdir = tempdir / '.repo/projects/src/test.git'
+      gitdir.mkdir(parents=True)
+      cmd = ['git', 'init', '--bare', str(gitdir)]
+      subprocess.check_call(cmd)
+
+      dotgit = tempdir / 'src/test/.git'
+      dotgit.mkdir(parents=True)
+      for name in cls._SYMLINKS:
+        (dotgit / name).symlink_to(f'../../../.repo/projects/src/test.git/{name}')
+      for name in cls._FILES | cls._CLEAN_FILES:
+        (dotgit / name).write_text(name)
+
+      yield tempdir
+
+  def test_standard(self):
+    """Migrate a standard checkout that we expect."""
+    with self._simple_layout() as tempdir:
+      dotgit = tempdir / 'src/test/.git'
+      project.Project._MigrateOldWorkTreeGitDir(str(dotgit))
+
+      # Make sure the dir was transformed into a symlink.
+      self.assertTrue(dotgit.is_symlink())
+      self.assertEqual(str(dotgit.readlink()), '../../.repo/projects/src/test.git')
+
+      # Make sure files were moved over.
+      gitdir = tempdir / '.repo/projects/src/test.git'
+      for name in self._FILES:
+        self.assertEqual(name, (gitdir / name).read_text())
+      # Make sure files were removed.
+      for name in self._CLEAN_FILES:
+        self.assertFalse((gitdir / name).exists())
+
+  def test_unknown(self):
+    """A checkout with unknown files should abort."""
+    with self._simple_layout() as tempdir:
+      dotgit = tempdir / 'src/test/.git'
+      (tempdir / '.repo/projects/src/test.git/random-file').write_text('one')
+      (dotgit / 'random-file').write_text('two')
+      with self.assertRaises(error.GitError):
+        project.Project._MigrateOldWorkTreeGitDir(str(dotgit))
+
+      # Make sure no content was actually changed.
+      self.assertTrue(dotgit.is_dir())
+      for name in self._FILES:
+        self.assertTrue((dotgit / name).is_file())
+      for name in self._CLEAN_FILES:
+        self.assertTrue((dotgit / name).is_file())
+      for name in self._SYMLINKS:
+        self.assertTrue((dotgit / name).is_symlink())

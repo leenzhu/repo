@@ -1,5 +1,3 @@
-# -*- coding:utf-8 -*-
-#
 # Copyright (C) 2008 The Android Open Source Project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import print_function
 import errno
 import filecmp
 import glob
@@ -28,6 +25,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.parse
 
 from color import Coloring
 from git_command import GitCommand, git_require
@@ -42,16 +40,6 @@ from repo_trace import IsTrace, Trace
 
 from git_refs import GitRefs, HEAD, R_HEADS, R_TAGS, R_PUB, R_M, R_WORKTREE_M
 
-from pyversion import is_python3
-if is_python3():
-  import urllib.parse
-else:
-  import imp
-  import urlparse
-  urllib = imp.new_module('urllib')
-  urllib.parse = urlparse
-  input = raw_input  # noqa: F821
-
 
 # Maximum sleep time allowed during retries.
 MAXIMUM_RETRY_SLEEP_SEC = 3600.0
@@ -62,7 +50,8 @@ RETRY_JITTER_PERCENT = 0.1
 def _lwrite(path, content):
   lock = '%s.lock' % path
 
-  with open(lock, 'w') as fd:
+  # Maintain Unix line endings on all OS's to match git behavior.
+  with open(lock, 'w', newline='\n') as fd:
     fd.write(content)
 
   try:
@@ -243,7 +232,7 @@ class ReviewableBranch(object):
 class StatusColoring(Coloring):
 
   def __init__(self, config):
-    Coloring.__init__(self, config, 'status')
+    super().__init__(config, 'status')
     self.project = self.printer('header', attr='bold')
     self.branch = self.printer('header', attr='bold')
     self.nobranch = self.printer('nobranch', fg='red')
@@ -257,17 +246,33 @@ class StatusColoring(Coloring):
 class DiffColoring(Coloring):
 
   def __init__(self, config):
-    Coloring.__init__(self, config, 'diff')
+    super().__init__(config, 'diff')
     self.project = self.printer('header', attr='bold')
     self.fail = self.printer('fail', fg='red')
 
 
-class _Annotation(object):
+class Annotation(object):
 
   def __init__(self, name, value, keep):
     self.name = name
     self.value = value
     self.keep = keep
+
+  def __eq__(self, other):
+    if not isinstance(other, Annotation):
+      return False
+    return self.__dict__ == other.__dict__
+
+  def __lt__(self, other):
+    # This exists just so that lists of Annotation objects can be sorted, for
+    # use in comparisons.
+    if not isinstance(other, Annotation):
+      raise ValueError('comparison is not between two Annotation objects')
+    if self.name == other.name:
+      if self.value == other.value:
+        return self.keep < other.keep
+      return self.value < other.value
+    return self.name < other.name
 
 
 def _SafeExpandPath(base, subpath, skipfinal=False):
@@ -449,13 +454,10 @@ class RemoteSpec(object):
     self.orig_name = orig_name
     self.fetchUrl = fetchUrl
 
+
 class Project(object):
   # These objects can be shared between several working trees.
-  shareable_files = ['description', 'info']
-  shareable_dirs = ['hooks', 'objects', 'rr-cache', 'svn']
-  # These objects can only be used by a single working tree.
-  working_tree_files = ['config', 'packed-refs', 'shallow']
-  working_tree_dirs = ['logs', 'refs']
+  shareable_dirs = ['hooks', 'objects', 'rr-cache']
 
   def __init__(self,
                manifest,
@@ -510,24 +512,11 @@ class Project(object):
                      with exponential backoff and jitter.
       old_revision: saved git commit id for open GITC projects.
     """
-    self.manifest = manifest
+    self.client = self.manifest = manifest
     self.name = name
     self.remote = remote
-    self.gitdir = gitdir.replace('\\', '/')
-    self.objdir = objdir.replace('\\', '/')
-    if worktree:
-      self.worktree = os.path.normpath(worktree).replace('\\', '/')
-    else:
-      self.worktree = None
-    self.relpath = relpath
-    self.revisionExpr = revisionExpr
-
-    if revisionId is None \
-            and revisionExpr \
-            and IsId(revisionExpr):
-      self.revisionId = revisionExpr
-    else:
-      self.revisionId = revisionId
+    self.UpdatePaths(relpath, worktree, gitdir, objdir)
+    self.SetRevision(revisionExpr, revisionId=revisionId)
 
     self.rebase = rebase
     self.groups = groups
@@ -550,22 +539,41 @@ class Project(object):
     self.copyfiles = []
     self.linkfiles = []
     self.annotations = []
-    self.config = GitConfig.ForRepository(gitdir=self.gitdir,
-                                          defaults=self.manifest.globalConfig)
-
-    if self.worktree:
-      self.work_git = self._GitGetByExec(self, bare=False, gitdir=gitdir)
-    else:
-      self.work_git = None
-    self.bare_git = self._GitGetByExec(self, bare=True, gitdir=gitdir)
-    self.bare_ref = GitRefs(gitdir)
-    self.bare_objdir = self._GitGetByExec(self, bare=True, gitdir=objdir)
     self.dest_branch = dest_branch
     self.old_revision = old_revision
 
     # This will be filled in if a project is later identified to be the
     # project containing repo hooks.
     self.enabled_repo_hooks = []
+
+  def SetRevision(self, revisionExpr, revisionId=None):
+    """Set revisionId based on revision expression and id"""
+    self.revisionExpr = revisionExpr
+    if revisionId is None and revisionExpr and IsId(revisionExpr):
+      self.revisionId = self.revisionExpr
+    else:
+      self.revisionId = revisionId
+
+  def UpdatePaths(self, relpath, worktree, gitdir, objdir):
+    """Update paths used by this project"""
+    self.gitdir = gitdir.replace('\\', '/')
+    self.objdir = objdir.replace('\\', '/')
+    if worktree:
+      self.worktree = os.path.normpath(worktree).replace('\\', '/')
+    else:
+      self.worktree = None
+    self.relpath = relpath
+
+    self.config = GitConfig.ForRepository(gitdir=self.gitdir,
+                                          defaults=self.manifest.globalConfig)
+
+    if self.worktree:
+      self.work_git = self._GitGetByExec(self, bare=False, gitdir=self.gitdir)
+    else:
+      self.work_git = None
+    self.bare_git = self._GitGetByExec(self, bare=True, gitdir=self.gitdir)
+    self.bare_ref = GitRefs(self.gitdir)
+    self.bare_objdir = self._GitGetByExec(self, bare=True, gitdir=self.objdir)
 
   @property
   def Derived(self):
@@ -842,10 +850,12 @@ class Project(object):
 
     return 'DIRTY'
 
-  def PrintWorkTreeDiff(self, absolute_paths=False):
+  def PrintWorkTreeDiff(self, absolute_paths=False, output_redir=None):
     """Prints the status of the repository to stdout.
     """
     out = DiffColoring(self.config)
+    if output_redir:
+      out.redirect(output_redir)
     cmd = ['diff']
     if out.is_on:
       cmd.append('--color')
@@ -859,6 +869,7 @@ class Project(object):
                      cmd,
                      capture_stdout=True,
                      capture_stderr=True)
+      p.Wait()
     except GitError as e:
       out.nl()
       out.project('project %s/' % self.relpath)
@@ -866,16 +877,11 @@ class Project(object):
       out.fail('%s', str(e))
       out.nl()
       return False
-    has_diff = False
-    for line in p.process.stdout:
-      if not hasattr(line, 'encode'):
-        line = line.decode()
-      if not has_diff:
-        out.nl()
-        out.project('project %s/' % self.relpath)
-        out.nl()
-        has_diff = True
-      print(line[:-1])
+    if p.stdout:
+      out.nl()
+      out.project('project %s/' % self.relpath)
+      out.nl()
+      out.write('%s', p.stdout)
     return p.Wait() == 0
 
 # Publish / Upload ##
@@ -1026,10 +1032,11 @@ class Project(object):
     if GitCommand(self, cmd, bare=True).Wait() != 0:
       raise UploadError('Upload failed')
 
-    msg = "posted to %s for %s" % (branch.remote.review, dest_branch)
-    self.bare_git.UpdateRef(R_PUB + branch.name,
-                            R_HEADS + branch.name,
-                            message=msg)
+    if not dryrun:
+      msg = "posted to %s for %s" % (branch.remote.review, dest_branch)
+      self.bare_git.UpdateRef(R_PUB + branch.name,
+                              R_HEADS + branch.name,
+                              message=msg)
 
 # Sync ##
   def _ExtractArchive(self, tarpath, path=None):
@@ -1050,17 +1057,20 @@ class Project(object):
   def Sync_NetworkHalf(self,
                        quiet=False,
                        verbose=False,
+                       output_redir=None,
                        is_new=None,
-                       current_branch_only=False,
+                       current_branch_only=None,
                        force_sync=False,
                        clone_bundle=True,
-                       tags=True,
+                       tags=None,
                        archive=False,
                        optimized_fetch=False,
                        retry_fetches=0,
                        prune=False,
                        submodules=False,
-                       clone_filter=None):
+                       ssh_proxy=None,
+                       clone_filter=None,
+                       partial_clone_exclude=set()):
     """Perform only the network IO portion of the sync process.
        Local working directory/branch state is not affected.
     """
@@ -1091,6 +1101,16 @@ class Project(object):
         _warn("Cannot remove archive %s: %s", tarpath, str(e))
       self._CopyAndLinkFiles()
       return True
+
+    # If the shared object dir already exists, don't try to rebootstrap with a
+    # clone bundle download.  We should have the majority of objects already.
+    if clone_bundle and os.path.exists(self.objdir):
+      clone_bundle = False
+
+    if self.name in partial_clone_exclude:
+      clone_bundle = True
+      clone_filter = None
+
     if is_new is None:
       is_new = not self.Exists
     if is_new:
@@ -1115,7 +1135,7 @@ class Project(object):
             and self._ApplyCloneBundle(initial=is_new, quiet=quiet, verbose=verbose)):
       is_new = False
 
-    if not current_branch_only:
+    if current_branch_only is None:
       if self.sync_c:
         current_branch_only = True
       elif not self.manifest._loaded:
@@ -1124,8 +1144,8 @@ class Project(object):
       elif self.manifest.default.sync_c:
         current_branch_only = True
 
-    if not self.sync_tags:
-      tags = False
+    if tags is None:
+      tags = self.sync_tags
 
     if self.clone_depth:
       depth = self.clone_depth
@@ -1137,10 +1157,12 @@ class Project(object):
             (ID_RE.match(self.revisionExpr) and
              self._CheckForImmutableRevision())):
       if not self._RemoteFetch(
-              initial=is_new, quiet=quiet, verbose=verbose, alt_dir=alt_dir,
-              current_branch_only=current_branch_only,
+              initial=is_new,
+              quiet=quiet, verbose=verbose, output_redir=output_redir,
+              alt_dir=alt_dir, current_branch_only=current_branch_only,
               tags=tags, prune=prune, depth=depth,
               submodules=submodules, force_sync=force_sync,
+              ssh_proxy=ssh_proxy,
               clone_filter=clone_filter, retry_fetches=retry_fetches):
         return False
 
@@ -1150,7 +1172,11 @@ class Project(object):
       alternates_file = os.path.join(self.gitdir, 'objects/info/alternates')
       if os.path.exists(alternates_file):
         cmd = ['repack', '-a', '-d']
-        if GitCommand(self, cmd, bare=True).Wait() != 0:
+        p = GitCommand(self, cmd, bare=True, capture_stdout=bool(output_redir),
+                       merge_output=bool(output_redir))
+        if p.stdout and output_redir:
+          output_redir.write(p.stdout)
+        if p.Wait() != 0:
           return False
         platform_utils.remove(alternates_file)
 
@@ -1158,17 +1184,15 @@ class Project(object):
       self._InitMRef()
     else:
       self._InitMirrorHead()
-      try:
-        platform_utils.remove(os.path.join(self.gitdir, 'FETCH_HEAD'))
-      except OSError:
-        pass
+      platform_utils.remove(os.path.join(self.gitdir, 'FETCH_HEAD'),
+                            missing_ok=True)
     return True
 
   def PostRepoUpgrade(self):
     self._InitHooks()
 
   def _CopyAndLinkFiles(self):
-    if self.manifest.isGitcClient:
+    if self.client.isGitcClient:
       return
     for copyfile in self.copyfiles:
       copyfile._Copy()
@@ -1207,6 +1231,12 @@ class Project(object):
       raise ManifestInvalidRevisionError('revision %s in %s not found' %
                                          (self.revisionExpr, self.name))
 
+  def SetRevisionId(self, revisionId):
+    if self.revisionExpr:
+      self.upstream = self.revisionExpr
+
+    self.revisionId = revisionId
+
   def Sync_LocalHalf(self, syncbuf, force_sync=False, submodules=False):
     """Perform only the local IO portion of the sync process.
        Network access is not required.
@@ -1222,6 +1252,18 @@ class Project(object):
     all_refs = self.bare_ref.all
     self.CleanPublishedCache(all_refs)
     revid = self.GetRevisionId(all_refs)
+
+    # Special case the root of the repo client checkout.  Make sure it doesn't
+    # contain files being checked out to dirs we don't allow.
+    if self.relpath == '.':
+      PROTECTED_PATHS = {'.repo'}
+      paths = set(self.work_git.ls_tree('-z', '--name-only', '--', revid).split('\0'))
+      bad_paths = paths & PROTECTED_PATHS
+      if bad_paths:
+        syncbuf.fail(self,
+                     'Refusing to checkout project that writes to protected '
+                     'paths: %s' % (', '.join(bad_paths),))
+        return
 
     def _doff():
       self._FastForward(revid)
@@ -1422,7 +1464,7 @@ class Project(object):
     self.linkfiles.append(_LinkFile(self.worktree, src, topdir, dest))
 
   def AddAnnotation(self, name, value, keep):
-    self.annotations.append(_Annotation(name, value, keep))
+    self.annotations.append(Annotation(name, value, keep))
 
   def DownloadPatchSet(self, change_id, patch_id):
     """Download a single patch set of a single change to FETCH_HEAD.
@@ -1694,6 +1736,11 @@ class Project(object):
         if cb is None or name != cb:
           kill.append(name)
 
+    # Minor optimization: If there's nothing to prune, then don't try to read
+    # any project state.
+    if not kill and not cb:
+      return []
+
     rev = self.GetRevisionId(left)
     if cb is not None \
        and not self._revlist(HEAD + '...' + rev) \
@@ -1934,7 +1981,13 @@ class Project(object):
     try:
       # if revision (sha or tag) is not present then following function
       # throws an error.
-      self.bare_git.rev_parse('--verify', '%s^0' % self.revisionExpr)
+      self.bare_git.rev_list('-1', '--missing=allow-any',
+                             '%s^0' % self.revisionExpr, '--')
+      if self.upstream:
+        rev = self.GetRemote(self.remote.name).ToLocal(self.upstream)
+        self.bare_git.rev_list('-1', '--missing=allow-any',
+                               '%s^0' % rev, '--')
+        self.bare_git.merge_base('--is-ancestor', self.revisionExpr, rev)
       return True
     except GitError:
       # There is no such persistent revision. We have to fetch it.
@@ -1958,11 +2011,13 @@ class Project(object):
                    initial=False,
                    quiet=False,
                    verbose=False,
+                   output_redir=None,
                    alt_dir=None,
                    tags=True,
                    prune=False,
                    depth=None,
                    submodules=False,
+                   ssh_proxy=None,
                    force_sync=False,
                    clone_filter=None,
                    retry_fetches=2,
@@ -1985,8 +2040,11 @@ class Project(object):
 
     if current_branch_only:
       if self.revisionExpr.startswith(R_TAGS):
-        # this is a tag and its sha1 value should never change
+        # This is a tag and its commit id should never change.
         tag_name = self.revisionExpr[len(R_TAGS):]
+      elif self.upstream and self.upstream.startswith(R_TAGS):
+        # This is a tag and its commit id should never change.
+        tag_name = self.upstream[len(R_TAGS):]
 
       if is_sha1 or tag_name is not None:
         if self._CheckForImmutableRevision():
@@ -2010,16 +2068,14 @@ class Project(object):
     if not name:
       name = self.remote.name
 
-    ssh_proxy = False
     remote = self.GetRemote(name)
-    if remote.PreConnectFetch():
-      ssh_proxy = True
+    if not remote.PreConnectFetch(ssh_proxy):
+      ssh_proxy = None
 
     if initial:
       if alt_dir and 'objects' == os.path.basename(alt_dir):
         ref_dir = os.path.dirname(alt_dir)
         packed_refs = os.path.join(self.gitdir, 'packed-refs')
-        remote = self.GetRemote(name)
 
         all_refs = self.bare_ref.all
         ids = set(all_refs.values())
@@ -2106,6 +2162,8 @@ class Project(object):
       # Shallow checkout of a specific commit, fetch from that commit and not
       # the heads only as the commit might be deeper in the history.
       spec.append(branch)
+      if self.upstream:
+        spec.append(self.upstream)
     else:
       if is_sha1:
         branch = self.upstream
@@ -2135,29 +2193,27 @@ class Project(object):
     ok = prune_tried = False
     for try_n in range(retry_fetches):
       gitcmd = GitCommand(self, cmd, bare=True, ssh_proxy=ssh_proxy,
-                          merge_output=True, capture_stdout=quiet)
+                          merge_output=True, capture_stdout=quiet or bool(output_redir))
+      if gitcmd.stdout and not quiet and output_redir:
+        output_redir.write(gitcmd.stdout)
       ret = gitcmd.Wait()
       if ret == 0:
         ok = True
         break
 
       # Retry later due to HTTP 429 Too Many Requests.
-      elif ('error:' in gitcmd.stderr and
-            'HTTP 429' in gitcmd.stderr):
-        if not quiet:
-          print('429 received, sleeping: %s sec' % retry_cur_sleep,
-                file=sys.stderr)
-        time.sleep(retry_cur_sleep)
-        retry_cur_sleep = min(retry_exp_factor * retry_cur_sleep,
-                              MAXIMUM_RETRY_SLEEP_SEC)
-        retry_cur_sleep *= (1 - random.uniform(-RETRY_JITTER_PERCENT,
-                                               RETRY_JITTER_PERCENT))
-        continue
+      elif (gitcmd.stdout and
+            'error:' in gitcmd.stdout and
+            'HTTP 429' in gitcmd.stdout):
+        # Fallthru to sleep+retry logic at the bottom.
+        pass
 
-      # If this is not last attempt, try 'git remote prune'.
-      elif (try_n < retry_fetches - 1 and
-            'error:' in gitcmd.stderr and
-            'git remote prune' in gitcmd.stderr and
+      # Try to prune remote branches once in case there are conflicts.
+      # For example, if the remote had refs/heads/upstream, but deleted that and
+      # now has refs/heads/upstream/foo.
+      elif (gitcmd.stdout and
+            'error:' in gitcmd.stdout and
+            'git remote prune' in gitcmd.stdout and
             not prune_tried):
         prune_tried = True
         prunecmd = GitCommand(self, ['remote', 'prune', name], bare=True,
@@ -2165,6 +2221,8 @@ class Project(object):
         ret = prunecmd.Wait()
         if ret:
           break
+        print('retrying fetch after pruning remote branches', file=output_redir)
+        # Continue right away so we don't sleep as we shouldn't need to.
         continue
       elif current_branch_only and is_sha1 and ret == 128:
         # Exit code 128 means "couldn't find the ref you asked for"; if we're
@@ -2174,9 +2232,18 @@ class Project(object):
       elif ret < 0:
         # Git died with a signal, exit immediately
         break
-      if not verbose:
-        print('%s:\n%s' % (self.name, gitcmd.stdout), file=sys.stderr)
-      time.sleep(random.randint(30, 45))
+
+      # Figure out how long to sleep before the next attempt, if there is one.
+      if not verbose and gitcmd.stdout:
+        print('\n%s:\n%s' % (self.name, gitcmd.stdout), end='', file=output_redir)
+      if try_n < retry_fetches - 1:
+        print('%s: sleeping %s seconds before retrying' % (self.name, retry_cur_sleep),
+              file=output_redir)
+        time.sleep(retry_cur_sleep)
+        retry_cur_sleep = min(retry_exp_factor * retry_cur_sleep,
+                              MAXIMUM_RETRY_SLEEP_SEC)
+        retry_cur_sleep *= (1 - random.uniform(-RETRY_JITTER_PERCENT,
+                                               RETRY_JITTER_PERCENT))
 
     if initial:
       if alt_dir:
@@ -2194,10 +2261,10 @@ class Project(object):
         # Sync the current branch only with depth set to None.
         # We always pass depth=None down to avoid infinite recursion.
         return self._RemoteFetch(
-            name=name, quiet=quiet, verbose=verbose,
+            name=name, quiet=quiet, verbose=verbose, output_redir=output_redir,
             current_branch_only=current_branch_only and depth,
             initial=False, alt_dir=alt_dir,
-            depth=None, clone_filter=clone_filter)
+            depth=None, ssh_proxy=ssh_proxy, clone_filter=clone_filter)
 
     return ok
 
@@ -2243,15 +2310,12 @@ class Project(object):
     cmd.append('+refs/tags/*:refs/tags/*')
 
     ok = GitCommand(self, cmd, bare=True).Wait() == 0
-    if os.path.exists(bundle_dst):
-      platform_utils.remove(bundle_dst)
-    if os.path.exists(bundle_tmp):
-      platform_utils.remove(bundle_tmp)
+    platform_utils.remove(bundle_dst, missing_ok=True)
+    platform_utils.remove(bundle_tmp, missing_ok=True)
     return ok
 
   def _FetchBundle(self, srcUrl, tmpPath, dstPath, quiet, verbose):
-    if os.path.exists(dstPath):
-      platform_utils.remove(dstPath)
+    platform_utils.remove(dstPath, missing_ok=True)
 
     cmd = ['curl', '--fail', '--output', tmpPath, '--netrc', '--location']
     if quiet:
@@ -2375,7 +2439,7 @@ class Project(object):
     if quiet:
       cmd.append('-q')
     if GitCommand(self, cmd).Wait() != 0:
-      raise GitError('%s submodule update --init --recursive %s ' % self.name)
+      raise GitError('%s submodule update --init --recursive ' % self.name)
 
   def _Rebase(self, upstream, onto=None):
     cmd = ['rebase']
@@ -2401,15 +2465,9 @@ class Project(object):
         os.makedirs(self.objdir)
         self.bare_objdir.init()
 
-        if self.use_git_worktrees:
-          # Set up the m/ space to point to the worktree-specific ref space.
-          # We'll update the worktree-specific ref space on each checkout.
-          if self.manifest.branch:
-            self.bare_git.symbolic_ref(
-                '-m', 'redirecting to worktree scope',
-                R_M + self.manifest.branch,
-                R_WORKTREE_M + self.manifest.branch)
+        self._UpdateHooks(quiet=quiet)
 
+        if self.use_git_worktrees:
           # Enable per-worktree config file support if possible.  This is more a
           # nice-to-have feature for users rather than a hard requirement.
           if git_require((2, 20, 0)):
@@ -2421,10 +2479,9 @@ class Project(object):
           os.makedirs(self.gitdir)
 
         if init_obj_dir or init_git_dir:
-          self._ReferenceGitDir(self.objdir, self.gitdir, share_refs=False,
-                                copy_all=True)
+          self._ReferenceGitDir(self.objdir, self.gitdir, copy_all=True)
         try:
-          self._CheckDirReference(self.objdir, self.gitdir, share_refs=False)
+          self._CheckDirReference(self.objdir, self.gitdir)
         except GitError as e:
           if force_sync:
             print("Retrying clone after deleting %s" %
@@ -2469,18 +2526,13 @@ class Project(object):
             _lwrite(os.path.join(self.gitdir, 'objects/info/alternates'),
                     os.path.join(ref_dir, 'objects') + '\n')
 
-        self._UpdateHooks(quiet=quiet)
-
         m = self.manifest.manifestProject.config
         for key in ['user.name', 'user.email']:
           if m.Has(key, include_defaults=False):
             self.config.SetString(key, m.GetString(key))
         self.config.SetString('filter.lfs.smudge', 'git-lfs smudge --skip -- %f')
         self.config.SetString('filter.lfs.process', 'git-lfs filter-process --skip')
-        if self.manifest.IsMirror:
-          self.config.SetString('core.bare', 'true')
-        else:
-          self.config.SetString('core.bare', None)
+        self.config.SetBoolean('core.bare', True if self.manifest.IsMirror else None)
     except Exception:
       if init_obj_dir and os.path.exists(self.objdir):
         platform_utils.rmtree(self.objdir)
@@ -2489,13 +2541,18 @@ class Project(object):
       raise
 
   def _UpdateHooks(self, quiet=False):
-    if os.path.exists(self.gitdir):
+    if os.path.exists(self.objdir):
       self._InitHooks(quiet=quiet)
 
   def _InitHooks(self, quiet=False):
-    hooks = platform_utils.realpath(self._gitdir_path('hooks'))
+    hooks = platform_utils.realpath(os.path.join(self.objdir, 'hooks'))
     if not os.path.exists(hooks):
       os.makedirs(hooks)
+
+    # Delete sample hooks.  They're noise.
+    for hook in glob.glob(os.path.join(hooks, '*.sample')):
+      platform_utils.remove(hook, missing_ok=True)
+
     for stock_hook in _ProjectHooks():
       name = os.path.basename(stock_hook)
 
@@ -2549,6 +2606,14 @@ class Project(object):
   def _InitMRef(self):
     if self.manifest.branch:
       if self.use_git_worktrees:
+        # Set up the m/ space to point to the worktree-specific ref space.
+        # We'll update the worktree-specific ref space on each checkout.
+        ref = R_M + self.manifest.branch
+        if not self.bare_ref.symref(ref):
+          self.bare_git.symbolic_ref(
+              '-m', 'redirecting to worktree scope',
+              ref, R_WORKTREE_M + self.manifest.branch)
+
         # We can't update this ref with git worktrees until it exists.
         # We'll wait until the initial checkout to set it.
         if not os.path.exists(self.worktree):
@@ -2556,6 +2621,8 @@ class Project(object):
 
         base = R_WORKTREE_M
         active_git = self.work_git
+
+        self._InitAnyMRef(HEAD, self.bare_git, detach=True)
       else:
         base = R_M
         active_git = self.bare_git
@@ -2565,7 +2632,7 @@ class Project(object):
   def _InitMirrorHead(self):
     self._InitAnyMRef(HEAD, self.bare_git)
 
-  def _InitAnyMRef(self, ref, active_git):
+  def _InitAnyMRef(self, ref, active_git, detach=False):
     cur = self.bare_ref.symref(ref)
 
     if self.revisionId:
@@ -2578,41 +2645,20 @@ class Project(object):
       dst = remote.ToLocal(self.revisionExpr)
       if cur != dst:
         msg = 'manifest set to %s' % self.revisionExpr
-        active_git.symbolic_ref('-m', msg, ref, dst)
+        if detach:
+          active_git.UpdateRef(ref, dst, message=msg, detach=True)
+        else:
+          active_git.symbolic_ref('-m', msg, ref, dst)
 
-  def _CheckDirReference(self, srcdir, destdir, share_refs):
+  def _CheckDirReference(self, srcdir, destdir):
     # Git worktrees don't use symlinks to share at all.
     if self.use_git_worktrees:
       return
 
-    symlink_files = self.shareable_files[:]
-    symlink_dirs = self.shareable_dirs[:]
-    if share_refs:
-      symlink_files += self.working_tree_files
-      symlink_dirs += self.working_tree_dirs
-    to_symlink = symlink_files + symlink_dirs
-    for name in set(to_symlink):
+    for name in self.shareable_dirs:
       # Try to self-heal a bit in simple cases.
       dst_path = os.path.join(destdir, name)
       src_path = os.path.join(srcdir, name)
-
-      if name in self.working_tree_dirs:
-        # If the dir is missing under .repo/projects/, create it.
-        if not os.path.exists(src_path):
-          os.makedirs(src_path)
-
-      elif name in self.working_tree_files:
-        # If it's a file under the checkout .git/ and the .repo/projects/ has
-        # nothing, move the file under the .repo/projects/ tree.
-        if not os.path.exists(src_path) and os.path.isfile(dst_path):
-          platform_utils.rename(dst_path, src_path)
-
-      # If the path exists under the .repo/projects/ and there's no symlink
-      # under the checkout .git/, recreate the symlink.
-      if name in self.working_tree_dirs or name in self.working_tree_files:
-        if os.path.exists(src_path) and not os.path.exists(dst_path):
-          platform_utils.symlink(
-              os.path.relpath(src_path, os.path.dirname(dst_path)), dst_path)
 
       dst = platform_utils.realpath(dst_path)
       if os.path.lexists(dst):
@@ -2626,23 +2672,17 @@ class Project(object):
                          ' use `repo sync --force-sync {0}` to '
                          'proceed.'.format(self.relpath))
 
-  def _ReferenceGitDir(self, gitdir, dotgit, share_refs, copy_all):
+  def _ReferenceGitDir(self, gitdir, dotgit, copy_all):
     """Update |dotgit| to reference |gitdir|, using symlinks where possible.
 
     Args:
       gitdir: The bare git repository. Must already be initialized.
       dotgit: The repository you would like to initialize.
-      share_refs: If true, |dotgit| will store its refs under |gitdir|.
-          Only one work tree can store refs under a given |gitdir|.
       copy_all: If true, copy all remaining files from |gitdir| -> |dotgit|.
           This saves you the effort of initializing |dotgit| yourself.
     """
-    symlink_files = self.shareable_files[:]
     symlink_dirs = self.shareable_dirs[:]
-    if share_refs:
-      symlink_files += self.working_tree_files
-      symlink_dirs += self.working_tree_dirs
-    to_symlink = symlink_files + symlink_dirs
+    to_symlink = symlink_dirs
 
     to_copy = []
     if copy_all:
@@ -2670,14 +2710,6 @@ class Project(object):
           elif os.path.isfile(src):
             shutil.copy(src, dst)
 
-        # If the source file doesn't exist, ensure the destination
-        # file doesn't either.
-        if name in symlink_files and not os.path.lexists(src):
-          try:
-            platform_utils.remove(dst)
-          except OSError:
-            pass
-
       except OSError as e:
         if e.errno == errno.EPERM:
           raise DownloadError(self._get_symlink_error_message())
@@ -2701,61 +2733,124 @@ class Project(object):
     # Some platforms (e.g. Windows) won't let us update dotgit in situ because
     # of file permissions.  Delete it and recreate it from scratch to avoid.
     platform_utils.remove(dotgit)
-    # Use relative path from checkout->worktree.
-    with open(dotgit, 'w') as fp:
+    # Use relative path from checkout->worktree & maintain Unix line endings
+    # on all OS's to match git behavior.
+    with open(dotgit, 'w', newline='\n') as fp:
       print('gitdir:', os.path.relpath(git_worktree_path, self.worktree),
             file=fp)
-    # Use relative path from worktree->checkout.
-    with open(os.path.join(git_worktree_path, 'gitdir'), 'w') as fp:
+    # Use relative path from worktree->checkout & maintain Unix line endings
+    # on all OS's to match git behavior.
+    with open(os.path.join(git_worktree_path, 'gitdir'), 'w', newline='\n') as fp:
       print(os.path.relpath(dotgit, git_worktree_path), file=fp)
 
     self._InitMRef()
 
   def _InitWorkTree(self, force_sync=False, submodules=False):
-    realdotgit = os.path.join(self.worktree, '.git')
-    tmpdotgit = realdotgit + '.tmp'
-    init_dotgit = not os.path.exists(realdotgit)
-    if init_dotgit:
-      if self.use_git_worktrees:
+    """Setup the worktree .git path.
+
+    This is the user-visible path like src/foo/.git/.
+
+    With non-git-worktrees, this will be a symlink to the .repo/projects/ path.
+    With git-worktrees, this will be a .git file using "gitdir: ..." syntax.
+
+    Older checkouts had .git/ directories.  If we see that, migrate it.
+
+    This also handles changes in the manifest.  Maybe this project was backed
+    by "foo/bar" on the server, but now it's "new/foo/bar".  We have to update
+    the path we point to under .repo/projects/ to match.
+    """
+    dotgit = os.path.join(self.worktree, '.git')
+
+    # If using an old layout style (a directory), migrate it.
+    if not platform_utils.islink(dotgit) and platform_utils.isdir(dotgit):
+      self._MigrateOldWorkTreeGitDir(dotgit)
+
+    init_dotgit = not os.path.exists(dotgit)
+    if self.use_git_worktrees:
+      if init_dotgit:
         self._InitGitWorktree()
         self._CopyAndLinkFiles()
-        return
-
-      dotgit = tmpdotgit
-      platform_utils.rmtree(tmpdotgit, ignore_errors=True)
-      os.makedirs(tmpdotgit)
-      self._ReferenceGitDir(self.gitdir, tmpdotgit, share_refs=True,
-                            copy_all=False)
     else:
-      dotgit = realdotgit
+      if not init_dotgit:
+        # See if the project has changed.
+        if platform_utils.realpath(self.gitdir) != platform_utils.realpath(dotgit):
+          platform_utils.remove(dotgit)
 
-    try:
-      self._CheckDirReference(self.gitdir, dotgit, share_refs=True)
-    except GitError as e:
-      if force_sync and not init_dotgit:
-        try:
-          platform_utils.rmtree(dotgit)
-          return self._InitWorkTree(force_sync=False, submodules=submodules)
-        except Exception:
-          raise e
-      raise e
+      if init_dotgit or not os.path.exists(dotgit):
+        os.makedirs(self.worktree, exist_ok=True)
+        platform_utils.symlink(os.path.relpath(self.gitdir, self.worktree), dotgit)
 
-    if init_dotgit:
-      _lwrite(os.path.join(tmpdotgit, HEAD), '%s\n' % self.GetRevisionId())
+      if init_dotgit:
+        _lwrite(os.path.join(dotgit, HEAD), '%s\n' % self.GetRevisionId())
 
-      # Now that the .git dir is fully set up, move it to its final home.
-      platform_utils.rename(tmpdotgit, realdotgit)
+        # Finish checking out the worktree.
+        cmd = ['read-tree', '--reset', '-u', '-v', HEAD]
+        if GitCommand(self, cmd).Wait() != 0:
+          raise GitError('Cannot initialize work tree for ' + self.name)
 
-      # Finish checking out the worktree.
-      cmd = ['read-tree', '--reset', '-u']
-      cmd.append('-v')
-      cmd.append(HEAD)
-      if GitCommand(self, cmd).Wait() != 0:
-        raise GitError('Cannot initialize work tree for ' + self.name)
+        if submodules:
+          self._SyncSubmodules(quiet=True)
+        self._CopyAndLinkFiles()
 
-      if submodules:
-        self._SyncSubmodules(quiet=True)
-      self._CopyAndLinkFiles()
+  @classmethod
+  def _MigrateOldWorkTreeGitDir(cls, dotgit):
+    """Migrate the old worktree .git/ dir style to a symlink.
+
+    This logic specifically only uses state from |dotgit| to figure out where to
+    move content and not |self|.  This way if the backing project also changed
+    places, we only do the .git/ dir to .git symlink migration here.  The path
+    updates will happen independently.
+    """
+    # Figure out where in .repo/projects/ it's pointing to.
+    if not os.path.islink(os.path.join(dotgit, 'refs')):
+      raise GitError(f'{dotgit}: unsupported checkout state')
+    gitdir = os.path.dirname(os.path.realpath(os.path.join(dotgit, 'refs')))
+
+    # Remove known symlink paths that exist in .repo/projects/.
+    KNOWN_LINKS = {
+        'config', 'description', 'hooks', 'info', 'logs', 'objects',
+        'packed-refs', 'refs', 'rr-cache', 'shallow', 'svn',
+    }
+    # Paths that we know will be in both, but are safe to clobber in .repo/projects/.
+    SAFE_TO_CLOBBER = {
+        'COMMIT_EDITMSG', 'FETCH_HEAD', 'HEAD', 'gitk.cache', 'index', 'ORIG_HEAD',
+    }
+
+    # First see if we'd succeed before starting the migration.
+    unknown_paths = []
+    for name in platform_utils.listdir(dotgit):
+      # Ignore all temporary/backup names.  These are common with vim & emacs.
+      if name.endswith('~') or (name[0] == '#' and name[-1] == '#'):
+        continue
+
+      dotgit_path = os.path.join(dotgit, name)
+      if name in KNOWN_LINKS:
+        if not platform_utils.islink(dotgit_path):
+          unknown_paths.append(f'{dotgit_path}: should be a symlink')
+      else:
+        gitdir_path = os.path.join(gitdir, name)
+        if name not in SAFE_TO_CLOBBER and os.path.exists(gitdir_path):
+          unknown_paths.append(f'{dotgit_path}: unknown file; please file a bug')
+    if unknown_paths:
+      raise GitError('Aborting migration: ' + '\n'.join(unknown_paths))
+
+    # Now walk the paths and sync the .git/ to .repo/projects/.
+    for name in platform_utils.listdir(dotgit):
+      dotgit_path = os.path.join(dotgit, name)
+
+      # Ignore all temporary/backup names.  These are common with vim & emacs.
+      if name.endswith('~') or (name[0] == '#' and name[-1] == '#'):
+        platform_utils.remove(dotgit_path)
+      elif name in KNOWN_LINKS:
+        platform_utils.remove(dotgit_path)
+      else:
+        gitdir_path = os.path.join(gitdir, name)
+        platform_utils.remove(gitdir_path, missing_ok=True)
+        platform_utils.rename(dotgit_path, gitdir_path)
+
+    # Now that the dir should be empty, clear it out, and symlink it over.
+    platform_utils.rmdir(dotgit)
+    platform_utils.symlink(os.path.relpath(gitdir, os.path.dirname(dotgit)), dotgit)
 
   def _get_symlink_error_message(self):
     if platform_utils.isWindows():
@@ -2764,9 +2859,6 @@ class Project(object):
               'https://github.com/git-for-windows/git/wiki/Symbolic-Links '
               'for other options.')
     return 'filesystem must support symlinks'
-
-  def _gitdir_path(self, path):
-    return platform_utils.realpath(os.path.join(self.gitdir, path))
 
   def _revlist(self, *args, **kw):
     a = []
@@ -2862,48 +2954,44 @@ class Project(object):
                      bare=False,
                      capture_stdout=True,
                      capture_stderr=True)
-      try:
-        out = p.process.stdout.read()
-        if not hasattr(out, 'encode'):
-          out = out.decode()
-        r = {}
-        if out:
-          out = iter(out[:-1].split('\0'))
-          while out:
-            try:
-              info = next(out)
-              path = next(out)
-            except StopIteration:
-              break
+      p.Wait()
+      r = {}
+      out = p.stdout
+      if out:
+        out = iter(out[:-1].split('\0'))
+        while out:
+          try:
+            info = next(out)
+            path = next(out)
+          except StopIteration:
+            break
 
-            class _Info(object):
+          class _Info(object):
 
-              def __init__(self, path, omode, nmode, oid, nid, state):
-                self.path = path
-                self.src_path = None
-                self.old_mode = omode
-                self.new_mode = nmode
-                self.old_id = oid
-                self.new_id = nid
+            def __init__(self, path, omode, nmode, oid, nid, state):
+              self.path = path
+              self.src_path = None
+              self.old_mode = omode
+              self.new_mode = nmode
+              self.old_id = oid
+              self.new_id = nid
 
-                if len(state) == 1:
-                  self.status = state
-                  self.level = None
-                else:
-                  self.status = state[:1]
-                  self.level = state[1:]
-                  while self.level.startswith('0'):
-                    self.level = self.level[1:]
+              if len(state) == 1:
+                self.status = state
+                self.level = None
+              else:
+                self.status = state[:1]
+                self.level = state[1:]
+                while self.level.startswith('0'):
+                  self.level = self.level[1:]
 
-            info = info[1:].split(' ')
-            info = _Info(path, *info)
-            if info.status in ('R', 'C'):
-              info.src_path = info.path
-              info.path = next(out)
-            r[info.path] = info
-        return r
-      finally:
-        p.Wait()
+          info = info[1:].split(' ')
+          info = _Info(path, *info)
+          if info.status in ('R', 'C'):
+            info.src_path = info.path
+            info.path = next(out)
+          r[info.path] = info
+      return r
 
     def GetDotgitPath(self, subpath=None):
       """Return the full path to the .git dir.
@@ -3100,7 +3188,7 @@ class _Later(object):
 class _SyncColoring(Coloring):
 
   def __init__(self, config):
-    Coloring.__init__(self, config, 'reposync')
+    super().__init__(config, 'reposync')
     self.project = self.printer('header', attr='bold')
     self.info = self.printer('info')
     self.fail = self.printer('fail', fg='red')
